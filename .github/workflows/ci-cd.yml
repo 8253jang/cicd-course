@@ -1,0 +1,177 @@
+name: Settlement CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# 동일 브랜치에서 새 커밋 push 시 이전 실행 취소 (self-hosted runner 자원 절약)
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE_NAME: settlement
+  IMAGE_TAG: ${{ github.sha }}
+  KIND_CLUSTER: settlement-local
+  K8S_NAMESPACE: settlement
+
+jobs:
+  # ─────────────────────────────────────────────────────────
+  # 1. 코드 스타일 검사 (ruff + black)
+  # ─────────────────────────────────────────────────────────
+  lint:
+    name: Lint (ruff / black)
+    runs-on: [self-hosted, settlement]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install lint tools
+        run: pip install ruff==0.6.9 black==24.8.0
+
+      - name: Ruff (정적 분석)
+        run: ruff check src/ tests/
+
+      - name: Black (포맷 검사)
+        run: black --check --diff src/ tests/
+
+  # ─────────────────────────────────────────────────────────
+  # 2. pytest + 커버리지 80% 이상
+  # ─────────────────────────────────────────────────────────
+  test:
+    name: Test & Coverage
+    needs: lint
+    runs-on: [self-hosted, settlement]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
+
+      - name: Run pytest with coverage gate (80%)
+        run: |
+          pytest tests/ -v \
+            --cov=settlement \
+            --cov-report=term-missing \
+            --cov-report=xml \
+            --cov-fail-under=80
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage.xml
+          retention-days: 7
+
+  # ─────────────────────────────────────────────────────────
+  # 3. 멀티스테이지 Docker 빌드
+  # ─────────────────────────────────────────────────────────
+  build:
+    name: Docker Build
+    needs: test
+    runs-on: [self-hosted, settlement]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image (local docker daemon, 레지스트리 미사용)
+        run: |
+          docker build \
+            -t ${IMAGE_NAME}:${IMAGE_TAG} \
+            -t ${IMAGE_NAME}:latest \
+            .
+
+      # 이후 잡(스캔/배포)에서 재사용할 수 있도록 tar로 저장
+      # self-hosted라 로컬 docker 데몬은 공유되지만, 잡 격리를 명확히 하기 위해 명시적으로 전달
+      - name: Save image as artifact
+        run: docker save ${IMAGE_NAME}:${IMAGE_TAG} -o /tmp/${IMAGE_NAME}-${IMAGE_TAG}.tar
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: docker-image
+          path: /tmp/${{ env.IMAGE_NAME }}-${{ env.IMAGE_TAG }}.tar
+          retention-days: 1
+
+  # ─────────────────────────────────────────────────────────
+  # 4. Trivy 취약점 스캔 (CRITICAL 발견 시 빌드 실패)
+  # ─────────────────────────────────────────────────────────
+  scan:
+    name: Trivy Vulnerability Scan
+    needs: build
+    runs-on: [self-hosted, settlement]
+    steps:
+      - name: Trivy scan (CRITICAL만 게이트)
+        uses: aquasecurity/trivy-action@0.29.0
+        with:
+          image-ref: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+          format: table
+          severity: CRITICAL
+          exit-code: "1"          # CRITICAL 발견 시 파이프라인 실패
+          ignore-unfixed: true    # 패치 없는 취약점은 일단 통과 (정책에 따라 조정)
+          vuln-type: "os,library"
+
+      - name: Trivy scan (전체 리포트, 참고용)
+        if: always()
+        uses: aquasecurity/trivy-action@0.29.0
+        with:
+          image-ref: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+          format: sarif
+          output: trivy-results.sarif
+          exit-code: "0"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: trivy-report
+          path: trivy-results.sarif
+          retention-days: 7
+
+  # ─────────────────────────────────────────────────────────
+  # 5. (CD) kind 클러스터로 배포 - 레지스트리 없이 이미지 직접 로드
+  # ─────────────────────────────────────────────────────────
+  deploy:
+    name: Deploy to kind (settlement-local)
+    needs: scan
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: [self-hosted, settlement]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: kind 클러스터 컨텍스트 확인
+        run: |
+          kind get clusters | grep -qx "${KIND_CLUSTER}" \
+            || { echo "::error::kind 클러스터 '${KIND_CLUSTER}' 가 존재하지 않습니다"; exit 1; }
+          kubectl config use-context kind-${KIND_CLUSTER}
+
+      - name: 이미지를 kind 노드로 직접 로드 (레지스트리 미사용)
+        run: kind load docker-image ${IMAGE_NAME}:${IMAGE_TAG} --name ${KIND_CLUSTER}
+
+      - name: 네임스페이스 생성 (없으면)
+        run: kubectl create namespace ${K8S_NAMESPACE} --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: 매니페스트 적용
+        run: |
+          kubectl apply -n ${K8S_NAMESPACE} -f k8s/deployment.yaml
+          kubectl apply -n ${K8S_NAMESPACE} -f k8s/service.yaml
+
+      - name: 이미지 태그를 이번 빌드로 갱신
+        run: |
+          kubectl set image deployment/settlement \
+            settlement=${IMAGE_NAME}:${IMAGE_TAG} \
+            -n ${K8S_NAMESPACE}
+
+      - name: 롤아웃 대기 (실패 시 자동 실패 처리)
+        run: kubectl rollout status deployment/settlement -n ${K8S_NAMESPACE} --timeout=120s
