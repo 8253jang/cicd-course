@@ -46,7 +46,7 @@ jobs:
       - name: Run Black
         run: black --check .
 
-      # 단위 테스트 및 코드 커버리지 검사
+      # 단위 테스트 및 코드 커버리지 검사 
       - name: Run tests with coverage
         env:
           PYTHONPATH: src
@@ -76,3 +76,28 @@ jobs:
       - name: Verify Docker image
         run: |
           docker images settlement
+    
+      # Kind 클러스터에 Docker 이미지 로드 해보자
+      - name: Load Docker image into Kind
+        run: |
+          kind load docker-image settlement:latest --name settlement-local
+
+      # Kubernetes 리소스 배포
+      - name: Deploy to Kubernetes
+        run: |
+          kubectl apply -f k8s/
+
+      # 배포 상태 확인
+      - name: Check Deployment Status
+        run: |
+          kubectl rollout status deployment/settlement
+
+      # Pod 확인
+      - name: Check Pods
+        run: |
+          kubectl get pods -o wide
+
+      # Service 확인
+      - name: Check Services
+        run: |
+          kubectl get svc    
