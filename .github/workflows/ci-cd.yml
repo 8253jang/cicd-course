@@ -8,6 +8,10 @@ on:
     branches:
       - main
 
+env:
+  IMAGE_NAME: settlement
+  IMAGE_TAG: ${{ github.sha }}
+
 jobs:
   test-and-security:
     runs-on:
