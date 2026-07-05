@@ -59,3 +59,13 @@ jobs:
           exit-code: 1
           ignore-unfixed: true
           vuln-type: os,library
+          
+      - name: Build Docker image
+        run: |
+          docker build \
+            -t ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} \
+            -t ${{ env.IMAGE_NAME }}:latest \
+            .
+
+      - name: Check Docker images
+        run: docker images | grep ${{ env.IMAGE_NAME }}    
