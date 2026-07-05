@@ -77,6 +77,8 @@ jobs:
         run: |
           docker images settlement
     
+          
+    kubernetes-test:      
       # Kind 클러스터에 Docker 이미지 로드 해보자
       - name: Load Docker image into Kind
         run: |
